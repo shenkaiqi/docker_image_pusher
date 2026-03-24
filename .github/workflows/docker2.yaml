@@ -50,16 +50,17 @@ jobs:
       uses: docker/setup-buildx-action@v3
 
     - name: Build and push image Aliyun (Multi-Arch)
+      shell: bash  # 👈 关键：强制使用 bash
       run: |
-        set -e  # Exit on any error
+        set -euo pipefail  # 更严格的错误处理
 
         # 1. Login to Aliyun Registry
         echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
 
-        # 2. Pre-scan for duplicate image names (to decide namespace prefix)
+        # 2. Pre-scan for duplicate image names
         declare -A duplicate_images
         declare -A temp_map
-        while IFS= read -r line || [ -n "$line" ]; do
+        while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" ]] && continue
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             
@@ -78,19 +79,18 @@ jobs:
             fi       
         done < images.txt
         
-        # 3. Create temp file to record manifest mappings: TARGET|SUB
+        # 3. Create temp file for manifest list
         MANIFEST_LIST_FILE=$(mktemp)
         echo "Created temp manifest list file: $MANIFEST_LIST_FILE"
 
-        # 4. Main loop: pull, tag, push per architecture
-        while IFS= read -r line || [ -n "$line" ]; do
+        # 4. Main processing loop
+        while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" ]] && continue
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
         
             echo "----------------------------------------"
             echo "Processing: $line"
             
-            # Parse platform and image robustly
             platform=""
             if [[ "$line" =~ --platform[= ]([^ ]+) ]]; then
                 platform="${BASH_REMATCH[1]}"
@@ -99,16 +99,15 @@ jobs:
             clean_line=$(echo "$line" | sed -E 's/--platform[= ][^ ]+//g')
             image=$(echo "$clean_line" | awk '{print $NF}' | xargs)
             
-            if [ -z "$image" ]; then
-                echo "⚠️  Skipping invalid line: $line"
+            if [[ -z "$image" ]]; then
+                echo "⚠️ Skipping invalid line: $line"
                 continue
             fi
 
-            echo "Detected Platform: ${platform:-'default'}"
+            echo "Detected Platform: ${platform:-default}"
             echo "Detected Image: $image"
 
-            # Pull image
-            if [ -n "$platform" ]; then
+            if [[ -n "$platform" ]]; then
                 if ! docker pull --platform="$platform" "$image"; then
                     echo "❌ Failed to pull $image ($platform), skipping..."
                     continue
@@ -121,7 +120,6 @@ jobs:
                 platform="linux/amd64"
             fi
 
-            # Determine tagging prefix
             platform_prefix="${platform//\//_}_"
             image_clean="${image%%@*}"
             image_name_tag=$(echo "$image_clean" | awk -F'/' '{print $NF}')
@@ -143,59 +141,54 @@ jobs:
 
             echo "${target_image}|${sub_image}" >> "$MANIFEST_LIST_FILE"
 
-            # Cleanup local images
             docker rmi "$image_clean" 2>/dev/null || true
-            docker rmi "$sub_image"    2>/dev/null || true
+            docker rmi "$sub_image" 2>/dev/null || true
 
             df -hT
             echo "----------------------------------------"
         done < images.txt
 
-        # 5. DEBUG: Show what we collected
+        # 5. Debug output
         echo "=========================================="
         echo "Manifest mapping content:"
         cat "$MANIFEST_LIST_FILE" || echo "(empty)"
         echo "=========================================="
 
-        # 6. Merge phase: create multi-arch manifests
+        # 6. Create multi-arch manifests
         echo "Starting multi-arch manifest creation..."
 
-        # Use process substitution to avoid subshell in while loop
         while IFS= read -r target || [[ -n "$target" ]]; do
             [[ -z "$target" ]] && continue
-
             echo "→ Processing manifest for: $target"
-            subs=$(awk -F'|' -v t="$target" '$1 == t {print $2}' "$MANIFEST_LIST_FILE")
-            count=$(echo "$subs" | grep -c '^')
 
-            if [[ $count -lt 2 ]]; then
-                echo "  ⚠️  Only $count arch(s) for $target – skipping manifest."
+            mapfile -t subs < <(awk -F'|' -v t="$target" '$1 == t {print $2}' "$MANIFEST_LIST_FILE")
+            count=${#subs[@]}
+
+            if (( count < 2 )); then
+                echo "  ⚠️ Only $count arch(s) for $target – skipping manifest."
                 continue
             fi
 
-            # Remove existing local manifest (if any)
             docker manifest rm "$target" 2>/dev/null || true
 
-            # Build manifest create command
-            cmd="docker manifest create $target"
-            for sub in $subs; do
-                cmd="$cmd --amend $sub"
+            cmd=(docker manifest create "$target")
+            for sub in "${subs[@]}"; do
+                cmd+=(--amend "$sub")
             done
 
-            echo "  Executing: $cmd"
-            eval "$cmd"
+            echo "  Executing: ${cmd[*]}"
+            "${cmd[@]}"
 
-            # Annotate OS/arch
-            for sub in $subs; do
-                base_name=$(echo "$sub" | awk -F'/' '{print $NF}')
+            for sub in "${subs[@]}"; do
+                base_name=$(basename "$sub")
                 arch_prefix=$(echo "$base_name" | cut -d'_' -f1,2)
 
                 arch=""
                 case "$arch_prefix" in
-                    "linux_amd64")  arch="amd64" ;;
-                    "linux_arm64")  arch="arm64" ;;
-                    "linux_ppc64le") arch="ppc64le" ;;
-                    "linux_s390x")  arch="s390x" ;;
+                    linux_amd64)  arch="amd64" ;;
+                    linux_arm64)  arch="arm64" ;;
+                    linux_ppc64le) arch="ppc64le" ;;
+                    linux_s390x)  arch="s390x" ;;
                     *)
                         echo "  ❓ Unknown arch prefix: $arch_prefix (in $sub)"
                         continue
@@ -212,8 +205,6 @@ jobs:
 
         done < <(cut -d'|' -f1 "$MANIFEST_LIST_FILE" | sort -u)
 
-        # 7. Final cleanup
         rm -f "$MANIFEST_LIST_FILE"
         echo "✅ All done! Multi-arch sync completed."
         df -hT
-        
