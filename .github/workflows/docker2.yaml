@@ -17,9 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Before freeing up disk space
-      run: |
-        echo "Before freeing up disk space"
-        df -hT
+      run: df -hT
 
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
@@ -33,11 +31,6 @@ jobs:
     - name: Restart docker
       run: sudo service docker restart
 
-    - name: Free up disk space complete
-      run: |
-        echo "Free up disk space complete"
-        df -hT
-
     - name: Checkout Code
       uses: actions/checkout@v4
 
@@ -50,161 +43,127 @@ jobs:
       uses: docker/setup-buildx-action@v3
 
     - name: Build and push image Aliyun (Multi-Arch)
-      shell: bash  # 👈 关键：强制使用 bash
+      shell: bash
       run: |
-        set -euo pipefail  # 更严格的错误处理
+        set -euo pipefail
+        echo "✅ Runner architecture: $(uname -m)"
+        echo "✅ Docker version: $(docker --version)"
 
-        # 1. Login to Aliyun Registry
+        # 1. Login
         echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
 
-        # 2. Pre-scan for duplicate image names
-        declare -A duplicate_images
-        declare -A temp_map
+        # 2. Pre-scan duplicates (SAFE ARRAY ACCESS)
+        declare -A duplicate_images=()
+        declare -A temp_map=()
         while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            image=$(echo "$line" | awk '{print $NF}' | sed 's/@.*//')
+            image_name=$(echo "$image" | awk -F'[:/]' '{print $(NF-1)}' 2>/dev/null || echo "$image" | awk -F'/' '{print $NF}' | cut -d: -f1)
+            name_space=$(echo "$image" | awk -F'/' 'NF==3 {print $2} NF==2 {print $1}' | tr -d '[:space:]')
             
-            image=$(echo "$line" | awk '{print $NF}')
-            image="${image%%@*}"
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-            
-            if [[ -n "${temp_map[$image_name]}" ]]; then
-                if [[ "${temp_map[$image_name]}" != "$name_space" ]]; then
-                    duplicate_images[$image_name]="true"
-                fi
-            else
+            current_ns="${temp_map[$image_name]:-}"
+            if [[ -n "$current_ns" && "$current_ns" != "$name_space" ]]; then
+                duplicate_images[$image_name]="1"
+            elif [[ -z "$current_ns" ]]; then
                 temp_map[$image_name]="$name_space"
-            fi       
+            fi
         done < images.txt
-        
-        # 3. Create temp file for manifest list
-        MANIFEST_LIST_FILE=$(mktemp)
-        echo "Created temp manifest list file: $MANIFEST_LIST_FILE"
 
-        # 4. Main processing loop
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        # 3. Process images
+        MANIFEST_LIST_FILE=$(mktemp)
+        echo "📄 Manifest list file: $MANIFEST_LIST_FILE"
         
-            echo "----------------------------------------"
-            echo "Processing: $line"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]] && continue
             
+            # Parse platform safely
             platform=""
-            if [[ "$line" =~ --platform[= ]([^ ]+) ]]; then
+            if [[ "$line" =~ --platform[= ]([^[:space:]]+) ]]; then
                 platform="${BASH_REMATCH[1]}"
             fi
             
-            clean_line=$(echo "$line" | sed -E 's/--platform[= ][^ ]+//g')
-            image=$(echo "$clean_line" | awk '{print $NF}' | xargs)
+            image=$(echo "$line" | sed -E 's/--platform[= ][^ ]+//g' | awk '{print $NF}' | xargs)
+            [[ -z "$image" ]] && { echo "⚠️ Skip invalid line: $line"; continue; }
             
-            if [[ -z "$image" ]]; then
-                echo "⚠️ Skipping invalid line: $line"
-                continue
-            fi
-
-            echo "Detected Platform: ${platform:-default}"
-            echo "Detected Image: $image"
-
+            echo "🔄 Processing: $image ${platform:+(platform=$platform)}"
+            
+            # CRITICAL FIX: Detect actual pulled architecture if platform not specified
             if [[ -n "$platform" ]]; then
-                if ! docker pull --platform="$platform" "$image"; then
-                    echo "❌ Failed to pull $image ($platform), skipping..."
-                    continue
-                fi
+                docker pull --platform="$platform" "$image" || { echo "❌ Pull failed, skip"; continue; }
+                pulled_arch="${platform#*/}"  # Extract 'amd64' from 'linux/amd64'
             else
-                if ! docker pull "$image"; then
-                    echo "❌ Failed to pull $image, skipping..."
-                    continue
-                fi
-                platform="linux/amd64"
+                echo "⚠️ WARNING: No --platform specified! Auto-detecting architecture (may be unreliable)"
+                docker pull "$image" || { echo "❌ Pull failed, skip"; continue; }
+                # Get actual architecture of pulled image
+                pulled_arch=$(docker inspect "$image" -f '{{.Architecture}}' 2>/dev/null || echo "amd64")
+                platform="linux/$pulled_arch"
+                echo "🔍 Auto-detected architecture: $pulled_arch"
             fi
 
+            # Build tags
             platform_prefix="${platform//\//_}_"
             image_clean="${image%%@*}"
-            image_name_tag=$(echo "$image_clean" | awk -F'/' '{print $NF}')
-            name_space=$(echo "$image_clean" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-
-            name_space_prefix=""
-            if [[ -n "${duplicate_images[$image_name]}" ]] && [[ -n "$name_space" ]]; then
-                name_space_prefix="${name_space}_"
-            fi
-
-            sub_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${platform_prefix}${name_space_prefix}${image_name_tag}"
-            target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${name_space_prefix}${image_name_tag}"
-
-            echo "Tagging: $image_clean → $sub_image"
+            image_tag=$(echo "$image_clean" | awk -F':' '{print $NF}')
+            image_base=$(echo "$image_clean" | awk -F'[:/]' '{print $(NF-1)}' 2>/dev/null || echo "$image_clean" | awk -F'/' '{print $NF}' | cut -d: -f1)
+            name_space=$(echo "$image_clean" | awk -F'/' 'NF==3 {print $2} NF==2 {print $1}' | tr -d '[:space:]')
+            
+            ns_prefix=""
+            [[ -n "${duplicate_images[$image_base]:-}" && -n "$name_space" ]] && ns_prefix="${name_space}_"
+            
+            sub_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${platform_prefix}${ns_prefix}${image_base}:${image_tag}"
+            target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${ns_prefix}${image_base}:${image_tag}"
+            
             docker tag "$image_clean" "$sub_image"
-            echo "Pushing: $sub_image"
             docker push "$sub_image"
-
-            echo "${target_image}|${sub_image}" >> "$MANIFEST_LIST_FILE"
-
-            docker rmi "$image_clean" 2>/dev/null || true
-            docker rmi "$sub_image" 2>/dev/null || true
-
-            df -hT
-            echo "----------------------------------------"
+            echo "${target_image}|${sub_image}|${pulled_arch}" >> "$MANIFEST_LIST_FILE"
+            
+            docker rmi "$image_clean" "$sub_image" 2>/dev/null || true
         done < images.txt
 
-        # 5. Debug output
-        echo "=========================================="
-        echo "Manifest mapping content:"
-        cat "$MANIFEST_LIST_FILE" || echo "(empty)"
-        echo "=========================================="
+        # 4. DEBUG: Show collected data
+        echo -e "\n📋 Manifest mappings:"
+        [[ -s "$MANIFEST_LIST_FILE" ]] && cat "$MANIFEST_LIST_FILE" || echo "(No valid images processed)"
+        
+        # 5. CRITICAL FIX: Handle empty manifest file safely
+        if [[ ! -s "$MANIFEST_LIST_FILE" ]]; then
+            echo "⚠️ No images to merge into manifests. Skipping manifest creation."
+            rm -f "$MANIFEST_LIST_FILE"
+            echo "✅ Sync completed (no multi-arch manifests created)"
+            exit 0
+        fi
 
-        # 6. Create multi-arch manifests
-        echo "Starting multi-arch manifest creation..."
-
+        # 6. Create manifests (SAFE LOOP)
+        echo -e "\n🚀 Creating multi-arch manifests..."
         while IFS= read -r target || [[ -n "$target" ]]; do
             [[ -z "$target" ]] && continue
-            echo "→ Processing manifest for: $target"
-
-            mapfile -t subs < <(awk -F'|' -v t="$target" '$1 == t {print $2}' "$MANIFEST_LIST_FILE")
+            
+            # SAFE: Use awk to extract subs + arch, avoid mapfile on empty input
+            while IFS='|' read -r _ sub arch; do
+                [[ "$_" == "$target" ]] || continue
+                subs+=("$sub")
+                archs+=("$arch")
+            done < "$MANIFEST_LIST_FILE"
+            
             count=${#subs[@]}
-
             if (( count < 2 )); then
-                echo "  ⚠️ Only $count arch(s) for $target – skipping manifest."
+                echo "⏭️  Skip $target (only $count arch)"
+                unset subs archs
                 continue
             fi
-
+            
             docker manifest rm "$target" 2>/dev/null || true
-
-            cmd=(docker manifest create "$target")
-            for sub in "${subs[@]}"; do
-                cmd+=(--amend "$sub")
+            docker manifest create "$target" "${subs[@]/#/--amend }" >/dev/null
+            
+            for i in "${!subs[@]}"; do
+                echo "✏️  Annotate ${subs[$i]} → ${archs[$i]}"
+                docker manifest annotate "$target" "${subs[$i]}" --os linux --arch "${archs[$i]}" 2>/dev/null || true
             done
-
-            echo "  Executing: ${cmd[*]}"
-            "${cmd[@]}"
-
-            for sub in "${subs[@]}"; do
-                base_name=$(basename "$sub")
-                arch_prefix=$(echo "$base_name" | cut -d'_' -f1,2)
-
-                arch=""
-                case "$arch_prefix" in
-                    linux_amd64)  arch="amd64" ;;
-                    linux_arm64)  arch="arm64" ;;
-                    linux_ppc64le) arch="ppc64le" ;;
-                    linux_s390x)  arch="s390x" ;;
-                    *)
-                        echo "  ❓ Unknown arch prefix: $arch_prefix (in $sub)"
-                        continue
-                        ;;
-                esac
-
-                echo "  Annotating $sub → linux/$arch"
-                docker manifest annotate "$target" "$sub" --os linux --arch "$arch"
-            done
-
-            echo "  Pushing manifest: $target"
-            docker manifest push "$target"
-            echo "  ✅ Success: $target is now multi-arch!"
-
+            
+            docker manifest push "$target" >/dev/null
+            echo "✅ $target (archs: ${archs[*]})"
+            
+            unset subs archs
         done < <(cut -d'|' -f1 "$MANIFEST_LIST_FILE" | sort -u)
 
         rm -f "$MANIFEST_LIST_FILE"
-        echo "✅ All done! Multi-arch sync completed."
-        df -hT
+        echo -e "\n🎉 ALL DONE! Multi-arch sync completed successfully."
