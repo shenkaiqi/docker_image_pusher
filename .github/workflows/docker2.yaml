@@ -85,42 +85,60 @@ jobs:
             echo "----------------------------------------"
             echo "Processing: $line"
             
-            # 拉取
-            echo "docker pull $line"
-            if ! docker pull "$line"; then
-                echo "Error pulling $line, skipping..."
+            # --- 修正开始：正确解析 platform 和 image ---
+            
+            # 尝试提取 --platform 参数
+            # 支持写法：--platform=linux/amd64 image 或 --platform linux/amd64 image
+            platform=""
+            if [[ "$line" =~ --platform[= ]([^ ]+) ]]; then
+                platform="${BASH_REMATCH[1]}"
+            fi
+            
+            # 提取镜像名 (去除 --platform 部分后的剩余内容，并去掉首尾空格)
+            # 方法：将 line 中的 --platform... 替换为空，然后取最后一个字段
+            clean_line=$(echo "$line" | sed -E 's/--platform[= ][^ ]+//g')
+            image=$(echo "$clean_line" | awk '{print $NF}' | xargs) # xargs 用于去除首尾空格
+            
+            if [ -z "$image" ]; then
+                echo "Error: Could not parse image name from line: $line"
                 continue
             fi
 
-            # 解析平台
-            platform=$(echo "$line" | grep -oP '(?<=--platform[ =])[^ ]+' || echo "")
-            # 兼容旧写法或空格写法
-            if [ -z "$platform" ]; then
-                platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
+            echo "Detected Platform: ${platform:-'default'}"
+            echo "Detected Image: $image"
+
+            # 执行拉取
+            if [ -n "$platform" ]; then
+                echo "Running: docker pull --platform=$platform $image"
+                if ! docker pull --platform="$platform" "$image"; then
+                    echo "Error pulling $image with platform $platform, skipping..."
+                    continue
+                fi
+            else
+                echo "Running: docker pull $image"
+                if ! docker pull "$image"; then
+                    echo "Error pulling $image, skipping..."
+                    continue
+                fi
             fi
-            
+            # --- 修正结束 ---
+
+            # 解析平台前缀 (用于后续打标)
             if [ -z "$platform" ]; then
-                platform_prefix=""
-                # 如果没有指定平台，默认视为当前运行器架构，但为了合并逻辑严谨，
-                # 建议用户在 images.txt 中显式指定 --platform。
-                # 如果没指定，我们这里暂时不将其加入多架构合并列表，或者默认为 amd64
-                # 为了安全起见，如果没有指定平台，我们只推送到带前缀或不带前缀的单一镜像，不参与 manifest 合并
-                # 或者强制假设它是 amd64 (GitHub Runner 默认是 amd64)
-                platform="linux/amd64" 
+                platform="linux/amd64" # 默认
                 platform_prefix="linux_amd64_"
-                echo "No platform specified, defaulting to $platform for logic."
             else
                 platform_prefix="${platform//\//_}_"
             fi
             
-            # 解析镜像名称组件
-            image=$(echo "$line" | awk '{print $NF}')
-            image="${image%%@*}" # 去除 @sha256
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
+            # 解析镜像名称组件 (逻辑保持不变，但使用解析后的 $image)
+            image_clean="${image%%@*}" # 去除 @sha256
+            image_name_tag=$(echo "$image_clean" | awk -F'/' '{print $NF}')
+            name_space=$(echo "$image_clean" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
             image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
         
             name_space_prefix=""
+            # 注意：duplicate_images 逻辑依赖于之前的预处理，这里假设它依然有效
             if [[ -n "${duplicate_images[$image_name]}" ]]; then
                if [[ -n "$name_space" ]]; then
                   name_space_prefix="${name_space}_"
@@ -130,26 +148,23 @@ jobs:
             image_name_tag="${image_name_tag%%@*}"
             
             # 构造目标镜像名 (带架构前缀)
-            # 例如: registry.../google_containers/linux_amd64_cluster-autoscaler:v1.33.0
             sub_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${platform_prefix}${name_space_prefix}${image_name_tag}"
             
             # 构造最终用户使用的目标镜像名 (不带架构前缀，用于合并)
-            # 例如: registry.../google_containers/cluster-autoscaler:v1.33.0
             target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${name_space_prefix}${image_name_tag}"
 
-            echo "Tagging: $image -> $sub_image"
-            docker tag "$image" "$sub_image"
+            echo "Tagging: $image_clean -> $sub_image"
+            docker tag "$image_clean" "$sub_image"
             
             echo "Pushing sub-image: $sub_image"
             docker push "$sub_image"
             
-            # 记录到临时文件，用于后续合并
-            # 只有当成功推送后才记录
+            # 记录到临时文件
             echo "${target_image}|${sub_image}" >> "$MANIFEST_LIST_FILE"
 
-            # 本地清理以节省空间
-            echo "Cleaning up local images: $image and $sub_image"
-            docker rmi "$image" || true
+            # 本地清理
+            echo "Cleaning up local images: $image_clean and $sub_image"
+            docker rmi "$image_clean" || true
             docker rmi "$sub_image" || true
             
             df -hT
