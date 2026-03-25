@@ -1,7 +1,5 @@
 name: Docker Multi-Arch Build and Push
 
-# 当前时间：2026年3月25日，星期三9时9分。
-
 on:
   workflow_dispatch:
   push:
@@ -19,13 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Before freeing up disk space
-      run: |
-        echo "Before freeing up disk space"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      run: df -hT
 
-    # 增加可用磁盘空间
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
@@ -33,216 +26,142 @@ jobs:
         swap-size-mb: 128
         remove-dotnet: 'true'
         remove-haskell: 'true'
-        # 如果空间还是不够用，可以把以下开启，清理出更多空间
         remove-android: 'true'
         remove-codeql: 'true'
         build-mount-path: '/var/lib/docker/'
 
     - name: Restart docker
-      run: sudo service docker restart
-
-    - name: Free up disk space complete
-      run: |
-        echo "Free up disk space complete"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      run: sudo systemctl restart docker
 
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # 设置 QEMU 和 binfmt_misc 以支持跨架构构建
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
     - name: Docker Setup Buildx
       uses: docker/setup-buildx-action@v3
       with:
-        # 创建一个支持多架构的 builder
         platforms: linux/amd64,linux/arm64,linux/arm/v7
 
     - name: Login to Registry
-      run: |
-        docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
+      run: docker login -u "$ALIYUN_REGISTRY_USER" -p "$ALIYUN_REGISTRY_PASSWORD" "$ALIYUN_REGISTRY"
 
     - name: Build and push multi-arch images
       run: |
-        # 数据预处理,判断镜像是否重名
-        declare -A duplicate_images
-        declare -A temp_map
-        declare -A multi_arch_manifests # 用于记录需要创建manifest的镜像
-        declare -A multi_arch_variants  # 用于存储每个基础镜像的变体
+        # 初始化关联数组（bash 4.0+ 支持）
+        declare -A duplicate_images temp_map multi_arch_manifests multi_arch_variants
+        declare -a multi_arch_local_images
 
-        # 第一遍扫描：分析镜像并识别多架构需求
+        # ===== 阶段1：分析镜像结构 =====
         while IFS= read -r line || [ -n "$line" ]; do
-            # 忽略空行与注释
-            [[ -z "$line" ]] && continue
-            if echo "$line" | grep -q '^\s*#'; then
-                continue
-            fi
-
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-            # 将@sha256:等字符删除
-            image="${image%%@*}"
-            echo "Analyzing image: $image"
-            
-            # 提取平台信息
-            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
-            echo "Detected platform: $platform"
-            
-            # 获取镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            # 获取命名空间 例如kasmweb,  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            # 这里不要是空值影响判断
-            name_space="${name_space}_"
-            # 获取镜像名例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-            
-            # 如果镜像存在于数组中，则添加temp_map
-            if [[ -n "${temp_map[$image_name]}" ]]; then
-                 # 如果temp_map已经存在镜像名，判断是不是同一命名空间
-                 if [[ "${temp_map[$image_name]}" != $name_space  ]]; then
-                    echo "Duplicate image name detected: $image_name"
-                    duplicate_images[$image_name]="true"
-                 fi
-            else
-                # 存镜像的命名空间
-                temp_map[$image_name]=$name_space
-            fi
-
-            # 如果指定了平台，说明这是一个多架构镜像的变体
-            if [ -n "$platform" ]; then
-                multi_arch_manifests["$image_name"]="true"
-                # 存储变体信息: base_name->platform,image_ref
-                multi_arch_variants["$image_name,$platform"]="$image"
-            fi
+          [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+          
+          # 提取原始镜像引用（移除digest）
+          image=$(echo "$line" | awk '{print $NF}' | sed 's/@.*//')
+          platform=$(echo "$line" | grep -oP '(?<=--platform[= ])[^[:space:]]+' || echo "")
+          image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}' | sed 's/@.*//')
+          image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+          name_space=$(echo "$image" | awk -F'/' '{if(NF==3)print $2; else if(NF==2)print $1; else print ""}')
+          
+          # 检测重名（添加命名空间前缀防冲突）
+          ns_key="${name_space:-default}_"
+          [[ -n "${temp_map[$image_name]}" && "${temp_map[$image_name]}" != "$ns_key" ]] && duplicate_images[$image_name]="true"
+          temp_map[$image_name]="$ns_key"
+          
+          # 标记需创建manifest的镜像（含平台参数即为多架构变体）
+          [[ -n "$platform" ]] && multi_arch_manifests[$image_name]="true"
         done < images.txt
 
-
-        # 第二遍扫描：执行拉取、重命名和推送
+        # ===== 阶段2：拉取、重命名、推送 =====
         while IFS= read -r line || [ -n "$line" ]; do
-            # 忽略空行与注释
-            [[ -z "$line" ]] && continue
-            if echo "$line" | grep -q '^\s*#'; then
-                continue
-            fi
-
-            echo "Processing line: $line"
-            echo "Docker pull $line"
-            
-            # 执行拉取命令（包含可能的--platform参数）
-            docker pull $line
-
-            # --- 解析镜像引用 ---
-            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
-            echo "Parsed platform is $platform"
-            
-            # 如果存在架构信息 将架构信息拼到镜像名称前面
-            if [ -z "$platform" ]; then
-                platform_prefix=""
-            else
-                platform_prefix="${platform//\//_}_"
-            fi
-            echo "Platform prefix is $platform_prefix"
-            
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-
-            # 获取 镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            # 获取命名空间 例如kasmweb  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            # 获取镜像名例  例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-
-            name_space_prefix=""
-            # 如果镜像名重名
-            if [[ -n "${duplicate_images[$image_name]}" ]]; then
-               #如果命名空间非空，将命名空间加到前缀
-               if [[ -n "${name_space}" ]]; then
-                  name_space_prefix="${name_space//\//-}_"
-               fi
-            fi
-            
-            # 将@sha256:等字符删除
-            image_name_tag="${image_name_tag%%@*}"
-            
-            # --- 构建新镜像标签 ---
-            # 对于多架构镜像，我们先为每个变体推送带平台前缀的标签
-            new_image_with_platform="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
-            
-            echo "Docker tag $image -> $new_image_with_platform"
-            docker tag $image $new_image_with_platform
-            echo "Docker push $new_image_with_platform"
-            docker push $new_image_with_platform
-            
-            # --- 为多架构镜像准备manifest ---
-            if [[ -n "${multi_arch_manifests[$image_name]}" ]] && [ -n "$platform" ]; then
-                # 存储变体的最终阿里云标签，用于后续创建manifest
-                multi_arch_variants["final,$image_name,$platform"]="$new_image_with_platform"
-            fi
-
-            # --- 积极清理以释放空间 ---
-            echo "Aggressively cleaning up after processing $image_name_tag"
-            docker rmi $image 2>/dev/null || true
-            docker rmi $new_image_with_platform 2>/dev/null || true
-            # 定期运行docker system prune以清理未使用的数据
-            if (( $(docker images -q | wc -l) > 10 )); then
-              echo "Pruning unused docker data..."
-              docker system prune -af --volumes
-            fi
-            echo "Disk usage after cleanup:"
-            df -hT | head -n 2
-            
+          [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+          echo ">>> Processing: $line"
+          
+          # 拉取镜像（保留--platform参数）
+          docker pull $line 2>&1 | grep -v "WARNING" || true
+          
+          # 解析关键信息
+          platform=$(echo "$line" | grep -oP '(?<=--platform[= ])[^[:space:]]+' || echo "")
+          image=$(echo "$line" | awk '{print $NF}' | sed 's/@.*//')
+          image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}' | sed 's/@.*//')
+          image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+          name_space=$(echo "$image" | awk -F'/' '{if(NF==3)print $2; else if(NF==2)print $1; else print ""}')
+          
+          # 构建新标签（平台前缀 + 命名空间前缀防冲突）
+          platform_prefix="${platform//\//_}_"
+          ns_prefix=$([[ -n "${duplicate_images[$image_name]}" && -n "$name_space" ]] && echo "${name_space//-/_}_" || echo "")
+          new_tag="${platform_prefix}${ns_prefix}${image_name_tag}"
+          new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_tag"
+          
+          # 重命名并推送
+          docker tag "$image" "$new_image" 2>&1 | grep -v "WARNING" || true
+          docker push "$new_image" 2>&1 | grep -v "WARNING" || true
+          
+          # 智能清理策略
+          if [[ -n "${multi_arch_manifests[$image_name]}" && -n "$platform" ]]; then
+            # 多架构变体：保留推送后的镜像供manifest使用
+            multi_arch_variants["${image_name}|${platform}"]="$new_image"
+            multi_arch_local_images+=("$new_image")
+            docker rmi "$image" 2>/dev/null || true  # 仅删原始镜像
+          else
+            # 单架构镜像：立即清理
+            docker rmi "$image" "$new_image" 2>/dev/null || true
+          fi
+          
+          # 定期深度清理（防磁盘爆满）
+          if [[ $(docker images -q | wc -l) -gt 10 ]]; then
+            docker system prune -af --filter "until=1h" 2>/dev/null | true
+          fi
+          df -h / | tail -n 2
         done < images.txt
-        
-        # --- 创建并推送多架构manifest ---
-        # 在推送manifest之前，再次清理空间
-        echo "Final cleanup before creating manifests..."
-        docker system prune -af --volumes
-        df -hT | head -n 2
-        
+
+        # ===== 阶段3：创建并推送 Manifest List =====
+        echo -e "\n=== 🌐 Creating Multi-Arch Manifests ==="
         for base_name in "${!multi_arch_manifests[@]}"; do
-            # 收集该基础镜像的所有变体标签
-            local_variants=() # 使用局部变量避免语法错误
-            # 同时收集原始平台信息，用于注解
-            local_platforms=()
-            for key in "${!multi_arch_variants[@]}"; do
-                # 检查键是否以 "final,<base_name>" 开头
-                if [[ "$key" == "final,$base_name,"* ]]; then
-                    variant_tag="${multi_arch_variants[$key]}"
-                    # 从 key 中提取原始平台信息
-                    original_platform="${key#final,$base_name,}"
-                    local_variants+=("$variant_tag")
-                    local_platforms+=("$original_platform")
-                fi
-            done
-        
-            if [ ${#local_variants[@]} -gt 0 ]; then
-                echo "Found ${#local_variants[@]} variants for multi-arch image: $base_name. Creating manifest..."
-                
-                # 构建目标镜像名称（不带平台前缀）
-                final_target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$base_name:latest" # 确保添加了:latest或其他合适的标签
-        
-                # 创建manifest list
-                echo "Creating manifest for $final_target_image"
-                docker manifest create "$final_target_image" "${local_variants[@]}"
-                
-                # 添加注释以便在registry中查看
-                for i in "${!local_variants[@]}"; do
-                    variant="${local_variants[$i]}"
-                    platform_from_variant="${local_platforms[$i]}"
-                    echo "Annotating $variant with platform $platform_from_variant"
-                    # 直接使用从 key 中提取的原始平台信息进行注解
-                    docker manifest annotate "$final_target_image" "$variant" --arch "$platform_from_variant"
-                done
-                
-                # 推送manifest list
-                echo "Pushing manifest for $final_target_image"
-                docker manifest push "$final_target_image"
-                
-                echo "Successfully created and pushed multi-arch manifest for $final_target_image"
+          variants=() platforms=()
+          
+          # 精确收集该基础镜像的所有变体
+          for key in "${!multi_arch_variants[@]}"; do
+            if [[ "$key" == "$base_name|"* ]]; then
+              platform="${key#"$base_name|"}"  # 提取原始平台字符串 (如: linux/arm64)
+              variants+=("${multi_arch_variants[$key]}")
+              platforms+=("$platform")
             fi
+          done
+          
+          [[ ${#variants[@]} -eq 0 ]] && continue
+          
+          # 使用原镜像标签（从第一个变体提取标签部分）
+          tag=$(echo "${variants[0]}" | awk -F':' '{print $NF}')
+          target_manifest="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$base_name:$tag"
+          
+          echo "📦 Creating manifest: $target_manifest (${#variants[@]} variants)"
+          docker manifest create "$target_manifest" "${variants[@]}" 2>&1 | grep -v "WARNING" || true
+          
+          # 精确注解：拆分 os/arch/variant
+          for i in "${!platforms[@]}"; do
+            p="${platforms[$i]}"
+            if [[ "$p" == */*/* ]]; then
+              os="${p%%/*}"; rest="${p#*/}"; arch="${rest%%/*}"; variant="${rest##*/}"
+              docker manifest annotate "$target_manifest" "${variants[$i]}" \
+                --os "$os" --arch "$arch" --variant "$variant" 2>&1 | grep -v "WARNING" || true
+            else
+              os="${p%%/*}"; arch="${p##*/}"
+              docker manifest annotate "$target_manifest" "${variants[$i]}" \
+                --os "$os" --arch "$arch" 2>&1 | grep -v "WARNING" || true
+            fi
+          done
+          
+          docker manifest push "$target_manifest" 2>&1 | grep -v "WARNING" || true
+          echo "✅ Manifest pushed: $target_manifest"
         done
+
+        # ===== 阶段4：最终清理 =====
+        echo -e "\n=== 🧹 Final Cleanup ==="
+        for img in "${multi_arch_local_images[@]}"; do
+          docker rmi "$img" 2>/dev/null || true
+        done
+        docker system prune -af --filter "until=10m" 2>/dev/null | true
+        df -h / | tail -n 2
+        echo "✨ All tasks completed successfully!"
