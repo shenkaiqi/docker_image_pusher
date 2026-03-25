@@ -197,7 +197,7 @@ jobs:
             df -hT | head -n 2
             
         done < images.txt
-
+        
         # --- 创建并推送多架构manifest ---
         # 在推送manifest之前，再次清理空间
         echo "Final cleanup before creating manifests..."
@@ -207,11 +207,16 @@ jobs:
         for base_name in "${!multi_arch_manifests[@]}"; do
             # 收集该基础镜像的所有变体标签
             local_variants=() # 使用局部变量避免语法错误
+            # 同时收集原始平台信息，用于注解
+            local_platforms=()
             for key in "${!multi_arch_variants[@]}"; do
                 # 检查键是否以 "final,<base_name>" 开头
                 if [[ "$key" == "final,$base_name,"* ]]; then
                     variant_tag="${multi_arch_variants[$key]}"
+                    # 从 key 中提取原始平台信息
+                    original_platform="${key#final,$base_name,}"
                     local_variants+=("$variant_tag")
+                    local_platforms+=("$original_platform")
                 fi
             done
         
@@ -226,16 +231,12 @@ jobs:
                 docker manifest create "$final_target_image" "${local_variants[@]}"
                 
                 # 添加注释以便在registry中查看
-                for variant in "${local_variants[@]}"; do
-                    platform_from_variant=$(echo "$variant" | cut -d'_' -f1) # 从 new_image_with_platform 中提取 platform_prefix
-                    case "$platform_from_variant" in
-                        "linux_amd64") plat_spec="linux/amd64" ;;
-                        "linux_arm64") plat_spec="linux/arm64" ;;
-                        "linux_arm_v7") plat_spec="linux/arm/v7" ;;
-                        *) plat_spec="$platform_from_variant" ;; # fallback
-                    esac
-                    echo "Annotating $variant with platform $plat_spec"
-                    docker manifest annotate --arch "${plat_spec#linux/}" "$final_target_image" "$variant"
+                for i in "${!local_variants[@]}"; do
+                    variant="${local_variants[$i]}"
+                    platform_from_variant="${local_platforms[$i]}"
+                    echo "Annotating $variant with platform $platform_from_variant"
+                    # 直接使用从 key 中提取的原始平台信息进行注解
+                    docker manifest annotate "$final_target_image" "$variant" --arch "$platform_from_variant"
                 done
                 
                 # 推送manifest list
