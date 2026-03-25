@@ -203,7 +203,7 @@ jobs:
         echo "Final cleanup before creating manifests..."
         docker system prune -af --volumes
         df -hT | head -n 2
-
+        
         for base_name in "${!multi_arch_manifests[@]}"; do
             # 收集该基础镜像的所有变体标签
             local_variants=() # 使用局部变量避免语法错误
@@ -214,13 +214,13 @@ jobs:
                     local_variants+=("$variant_tag")
                 fi
             done
-
+        
             if [ ${#local_variants[@]} -gt 0 ]; then
                 echo "Found ${#local_variants[@]} variants for multi-arch image: $base_name. Creating manifest..."
                 
                 # 构建目标镜像名称（不带平台前缀）
-                final_target_image="$ALIYUN_REGISTRY/$ALIUN_NAME_SPACE/$base_name"
-
+                final_target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$base_name:latest" # 确保添加了:latest或其他合适的标签
+        
                 # 创建manifest list
                 echo "Creating manifest for $final_target_image"
                 docker manifest create "$final_target_image" "${local_variants[@]}"
