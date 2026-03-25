@@ -1,0 +1,241 @@
+name: Docker Multi-Arch Build and Push
+
+# 当前时间：2026年3月25日，星期三9时9分。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
+  ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
+  ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+
+jobs:
+  build:
+    name: Build and Push Multi-Arch
+    runs-on: ubuntu-latest
+    steps:
+    - name: Before freeing up disk space
+      run: |
+        echo "Before freeing up disk space"
+        echo "=============================================================================="
+        df -hT
+        echo "=============================================================================="
+
+    # 增加可用磁盘空间
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 128
+        remove-dotnet: 'true'
+        remove-haskell: 'true'
+        # 如果空间还是不够用，可以把以下开启，清理出更多空间
+        # remove-android: 'true'
+        # remove-codeql: 'true'
+        build-mount-path: '/var/lib/docker/'
+
+    - name: Restart docker
+      run: sudo service docker restart
+
+    - name: Free up disk space complete
+      run: |
+        echo "Free up disk space complete"
+        echo "=============================================================================="
+        df -hT
+        echo "=============================================================================="
+
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # 设置 QEMU 和 binfmt_misc 以支持跨架构构建
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Docker Setup Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        # 创建一个支持多架构的 builder
+        platforms: linux/amd64,linux/arm64,linux/arm/v7
+
+    - name: Login to Registry
+      run: |
+        docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
+
+    - name: Build and push multi-arch images
+      run: |
+        # 数据预处理,判断镜像是否重名
+        declare -A duplicate_images
+        declare -A temp_map
+        declare -A multi_arch_manifests # 用于记录需要创建manifest的镜像
+        declare -A multi_arch_variants  # 用于存储每个基础镜像的变体
+
+        # 第一遍扫描：分析镜像并识别多架构需求
+        while IFS= read -r line || [ -n "$line" ]; do
+            # 忽略空行与注释
+            [[ -z "$line" ]] && continue
+            if echo "$line" | grep -q '^\s*#'; then
+                continue
+            fi
+
+            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
+            image=$(echo "$line" | awk '{print $NF}')
+            # 将@sha256:等字符删除
+            image="${image%%@*}"
+            echo "Analyzing image: $image"
+            
+            # 提取平台信息
+            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
+            echo "Detected platform: $platform"
+            
+            # 获取镜像名:版本号  例如nginx:1.25.3
+            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
+            # 获取命名空间 例如kasmweb,  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
+            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
+            # 这里不要是空值影响判断
+            name_space="${name_space}_"
+            # 获取镜像名例如nginx
+            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+            
+            # 如果镜像存在于数组中，则添加temp_map
+            if [[ -n "${temp_map[$image_name]}" ]]; then
+                 # 如果temp_map已经存在镜像名，判断是不是同一命名空间
+                 if [[ "${temp_map[$image_name]}" != $name_space  ]]; then
+                    echo "Duplicate image name detected: $image_name"
+                    duplicate_images[$image_name]="true"
+                 fi
+            else
+                # 存镜像的命名空间
+                temp_map[$image_name]=$name_space
+            fi
+
+            # 如果指定了平台，说明这是一个多架构镜像的变体
+            if [ -n "$platform" ]; then
+                multi_arch_manifests["$image_name"]="true"
+                # 存储变体信息: base_name->platform,image_ref
+                multi_arch_variants["$image_name,$platform"]="$image"
+            fi
+        done < images.txt
+
+
+        # 第二遍扫描：执行拉取、重命名和推送
+        while IFS= read -r line || [ -n "$line" ]; do
+            # 忽略空行与注释
+            [[ -z "$line" ]] && continue
+            if echo "$line" | grep -q '^\s*#'; then
+                continue
+            fi
+
+            echo "Processing line: $line"
+            echo "Docker pull $line"
+            
+            # 执行拉取命令（包含可能的--platform参数）
+            docker pull $line
+
+            # --- 解析镜像引用 ---
+            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
+            echo "Parsed platform is $platform"
+            
+            # 如果存在架构信息 将架构信息拼到镜像名称前面
+            if [ -z "$platform" ]; then
+                platform_prefix=""
+            else
+                platform_prefix="${platform//\//_}_"
+            fi
+            echo "Platform prefix is $platform_prefix"
+            
+            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
+            image=$(echo "$line" | awk '{print $NF}')
+
+            # 获取 镜像名:版本号  例如nginx:1.25.3
+            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
+            # 获取命名空间 例如kasmweb  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
+            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
+            # 获取镜像名例  例如nginx
+            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+
+            name_space_prefix=""
+            # 如果镜像名重名
+            if [[ -n "${duplicate_images[$image_name]}" ]]; then
+               #如果命名空间非空，将命名空间加到前缀
+               if [[ -n "${name_space}" ]]; then
+                  name_space_prefix="${name_space//\//-}_"
+               fi
+            fi
+            
+            # 将@sha256:等字符删除
+            image_name_tag="${image_name_tag%%@*}"
+            
+            # --- 构建新镜像标签 ---
+            # 对于多架构镜像，我们先为每个变体推送带平台前缀的标签
+            new_image_with_platform="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
+            
+            echo "Docker tag $image -> $new_image_with_platform"
+            docker tag $image $new_image_with_platform
+            echo "Docker push $new_image_with_platform"
+            docker push $new_image_with_platform
+            
+            # --- 为多架构镜像准备manifest ---
+            if [[ -n "${multi_arch_manifests[$image_name]}" ]] && [ -n "$platform" ]; then
+                # 存储变体的最终阿里云标签，用于后续创建manifest
+                multi_arch_variants["final,$image_name,$platform"]="$new_image_with_platform"
+            fi
+
+            echo "开始清理磁盘空间"
+            echo "=============================================================================="
+            df -hT
+            echo "=============================================================================="
+            docker rmi $image
+            docker rmi $new_image_with_platform
+            echo "磁盘空间清理完毕"
+            echo "=============================================================================="
+            df -hT
+            echo "=============================================================================="
+            
+        done < images.txt
+
+        # --- 创建并推送多架构manifest ---
+        for base_name in "${!multi_arch_manifests[@]}"; do
+            # 收集该基础镜像的所有变体标签
+            local variants=()
+            for key in "${!multi_arch_variants[@]}"; do
+                # 检查键是否以 "final,<base_name>" 开头
+                if [[ "$key" == "final,$base_name,"* ]]; then
+                    variant_tag="${multi_arch_variants[$key]}"
+                    variants+=("$variant_tag")
+                fi
+            done
+
+            if [ ${#variants[@]} -gt 0 ]; then
+                echo "Found ${#variants[@]} variants for multi-arch image: $base_name. Creating manifest..."
+                
+                # 构建目标镜像名称（不带平台前缀）
+                final_target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$base_name"
+
+                # 创建manifest list
+                echo "Creating manifest for $final_target_image"
+                docker manifest create "$final_target_image" "${variants[@]}"
+                
+                # 添加注释以便在registry中查看
+                for variant in "${variants[@]}"; do
+                    platform_from_variant=$(echo "$variant" | cut -d'_' -f1) # 从 new_image_with_platform 中提取 platform_prefix
+                    case "$platform_from_variant" in
+                        "linux_amd64") plat_spec="linux/amd64" ;;
+                        "linux_arm64") plat_spec="linux/arm64" ;;
+                        "linux_arm_v7") plat_spec="linux/arm/v7" ;;
+                        *) plat_spec="$platform_from_variant" ;; # fallback
+                    esac
+                    echo "Annotating $variant with platform $plat_spec"
+                    docker manifest annotate --arch "${plat_spec#linux/}" "$final_target_image" "$variant"
+                done
+                
+                # 推送manifest list
+                echo "Pushing manifest for $final_target_image"
+                docker manifest push "$final_target_image"
+                
+                echo "Successfully created and pushed multi-arch manifest for $final_target_image"
+            fi
+        done
