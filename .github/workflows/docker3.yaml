@@ -53,45 +53,45 @@ jobs:
           exit 1
         fi
 
-        # 定义关联数组
-        declare -A image_variants # key: "repo:tag", value: "list of local tagged images"
-        declare -A platform_map   # key: "local_tagged_image", value: "platform string"
+        declare -A image_variants # key: "final_target_tag", value: "list of remote temp tags"
         
         echo "=== 📥 Phase 1: Pull, Tag, and Push Individual Architectures ==="
         
         while IFS= read -r line || [ -n "$line" ]; do
           [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
           
-          # 解析行内容
-          # 格式期望: --platform linux/amd64 registry/image:tag
-          # 或者: registry/image:tag (默认为当前架构或无需指定)
-          
           platform=""
           raw_image=""
           
+          # 解析平台参数
           if [[ "$line" =~ --platform[=\ ]([^[:space:]]+) ]]; then
             platform="${BASH_REMATCH[1]}"
-            # 提取最后一个参数作为镜像名
             raw_image=$(echo "$line" | awk '{print $NF}')
           else
             raw_image=$(echo "$line" | awk '{print $NF}')
           fi
           
-          # 去除可能存在的 digest
+          # 去除 digest
           raw_image=$(echo "$raw_image" | sed 's/@.*//')
           
-          # 提取基础名称 (去掉注册域和命名空间，只留 image:tag)
-          # 假设输入是: docker.io/library/nginx:1.25 或 registry.cn-hangzhou.aliyuncs.com/my/ns/app:v1
-          # 我们想要最终的目标标签是: $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/<image_name>:<tag>
-          
-          # 解析原始镜像的 name:tag
-          # 处理逻辑：找到最后一个 / 之后的部分
+          # 提取基础镜像名和标签 (image:tag)
           image_name_tag=$(basename "$raw_image") 
           
-          # 构造目标仓库地址 (统一推送到同一个阿里云仓库路径)
-          target_repo="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$image_name_tag"
+          # 分离名称和标签
+          if [[ "$image_name_tag" == *":"* ]]; then
+            img_name="${image_name_tag%:*}"
+            img_tag="${image_name_tag##*:}"
+          else
+            img_name="$image_name_tag"
+            img_tag="latest"
+          fi
           
-          echo "Processing: $raw_image (Platform: ${platform:-default}) -> Target: $target_repo"
+          # 构造最终目标仓库地址 (不带架构后缀)
+          target_repo="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$img_name"
+          final_target_tag="$target_repo:$img_tag"
+          
+          echo "Processing: $raw_image (Platform: ${platform:-default})"
+          echo "  -> Final Target: $final_target_tag"
           
           # 1. 拉取
           if [ -n "$platform" ]; then
@@ -100,65 +100,77 @@ jobs:
             docker pull "$raw_image"
           fi
           
-          # 2. 生成唯一的本地临时标签 (用于区分架构，防止冲突)
-          # 格式: temp_arch_<platform_sanitized>_<random_id>
-          safe_platform=$(echo "${platform:-single}" | tr '/' '_')
-          temp_local_tag="temp_${safe_platform}_$$_$RANDOM"
+          # 2. 生成本地临时标签
+          safe_platform="unknown"
+          arch_suffix=""
           
-          docker tag "$raw_image" "$temp_local_tag"
-          
-          # 3. 推送临时标签到阿里云 (作为中间步骤，确保远程有这些层)
-          # 注意：这里我们先推送到一个临时的、带架构后缀的标签，或者直接推送到目标标签？
-          # 策略修正：为了最终只有一个标签，我们需要先推送到远程的临时标签，然后合并。
-          # 或者：直接推送到目标标签会覆盖。
-          # 最佳实践：推送到远程的临时标签 (e.g., target_repo-temp-amd64)，最后合并删除。
-          
-          remote_temp_tag="${target_repo}-temp-${safe_platform}"
-          docker tag "$temp_local_tag" "$remote_temp_tag"
-          docker push "$remote_temp_tag"
-          
-          # 记录信息用于后续合并
-          # key 是最终想要的目标标签 (target_repo), value 是远程临时标签列表
-          if [ -z "${image_variants[$target_repo]}" ]; then
-            image_variants[$target_repo]="$remote_temp_tag"
+          if [ -n "$platform" ]; then
+            # 格式化平台字符串：
+            # linux/amd64 -> amd64
+            # linux/arm64 -> arm64
+            # linux/arm/v7 -> arm-v7 (或者保持 arm/v7，看你喜欢，这里替换 / 为 -)
+            safe_platform=$(echo "$platform" | sed 's|linux/||' | tr '/' '-')
+            arch_suffix="-${safe_platform}"
           else
-            image_variants[$target_repo]="${image_variants[$target_repo]} $remote_temp_tag"
+            # 单架构不加后缀，或者你可以加个 -single
+            arch_suffix="" 
           fi
           
-          # 记录平台信息 (如果需要显式注解)
-          platform_map["$remote_temp_tag"]="$platform"
+          # 构造远程临时标签： <repo>:<tag>-<arch>
+          # 例如: registry/namespace/app:v1.33.0-amd64
+          remote_temp_tag="$target_repo:${img_tag}${arch_suffix}"
+          
+          echo "  -> Temp Tag: $remote_temp_tag"
+          
+          # 本地打标
+          docker tag "$raw_image" "$remote_temp_tag"
+          
+          # 推送到远程临时标签
+          docker push "$remote_temp_tag"
+          
+          # 记录到数组，用于后续合并
+          # key 是最终标签，value 是临时标签列表
+          if [ -z "${image_variants[$final_target_tag]}" ]; then
+            image_variants[$final_target_tag]="$remote_temp_tag"
+          else
+            image_variants[$final_target_tag]="${image_variants[$final_target_tag]} $remote_temp_tag"
+          fi
           
           # 清理本地
-          docker rmi "$raw_image" "$temp_local_tag" "$remote_temp_tag" || true
+          docker rmi "$raw_image" "$remote_temp_tag" || true
           
         done < images.txt
 
         echo -e "\n=== 🧩 Phase 2: Create and Push Manifest Lists ==="
         
-        for target_tag in "${!image_variants[@]}"; do
-          variants=(${image_variants[$target_tag]})
+        for final_tag in "${!image_variants[@]}"; do
+          variants=(${image_variants[$final_tag]})
           
           if [ ${#variants[@]} -eq 1 ]; then
-            # 只有一个架构，直接重命名为最终标签
-            echo "✅ Single arch detected for $target_tag, renaming..."
-            src=${variants[0]}
-            docker buildx imagetools create --tag "$target_tag" "$src"
-            # 清理临时标签
-            docker buildx imagetools rm "$src" 2>/dev/null || true
-          else
-            # 多个架构，创建 Manifest List
-            echo "🌐 Creating multi-arch manifest for $target_tag from ${#variants[@]} variants..."
+            # 只有一个架构：直接将临时标签重命名为最终标签
+            echo "✅ Single arch detected for $final_tag"
+            echo "   Creating $final_tag from ${variants[0]}"
             
-            # 使用 buildx imagetools create 自动合并
-            # 它会自动检测远程镜像的架构信息，通常不需要手动 annotate
-            cmd="docker buildx imagetools create --tag \"$target_tag\""
+            docker buildx imagetools create --tag "$final_tag" "${variants[0]}"
+            
+            # 可选：如果不想保留带后缀的临时标签，可以删除它
+            # docker buildx imagetools rm "${variants[0]}" 2>/dev/null || true
+            # 注意：通常建议保留带后缀的标签以便调试，或者根据需求取消上面注释
+            
+          else
+            # 多个架构：合并为 Manifest List
+            echo "🌐 Creating multi-arch manifest for $final_tag"
+            echo "   Sources: ${variants[*]}"
+            
+            cmd="docker buildx imagetools create --tag \"$final_tag\""
             for v in "${variants[@]}"; do
               cmd="$cmd \"$v\""
             done
             
             eval $cmd
             
-            # 清理临时标签
+            # 合并完成后，可以选择删除临时的带后缀标签，保持仓库整洁
+            echo "   Cleaning up temp tags..."
             for v in "${variants[@]}"; do
               docker buildx imagetools rm "$v" 2>/dev/null || true
             done
